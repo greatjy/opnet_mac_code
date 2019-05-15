@@ -1,0 +1,357 @@
+/** Include files **/
+
+#include <math.h>
+#include <string.h>
+#include "oms_pr.h"
+#include "oms_tan.h"
+#include "oms_bgutil.h"
+#include "wlan_support.h"
+#include "oms_auto_addr_support.h"
+#include "oms_dist_support.h"
+#include "oms_dim_stat_support.h"
+#include "bridge_header.h"
+#include "jammers.h"	
+#include "prg_mapping.h"
+#include <prg_geo.h>
+#include "apptrack.h" 
+
+/** Constants **/
+
+/* Incoming statistics and stream wires.							*/
+#define 	TRANSMITTER_BUSY_INSTAT		1
+#define		LOW_LAYER_INPUT_STREAM		0
+#define		LOW_LAYER_OUTPUT_STREAM		0
+
+/* Special value indicating that the number of back-off slots are	*/
+/* not determined yet.												*/
+#define		BACKOFF_SLOTS_UNSET			-1.0
+
+/* Special value for nav_reset_time when NAV is not set based on a	*/
+/* received RTS.													*/
+#define		NAV_RESET_TIME_UNSET		-1.0
+	
+/* Define a small value (= 1 psec), which will be used to recover	*/
+/* from double arithmetic precision losts while doing time related	*/
+/* precision sensitive computations.								*/
+#define		PRECISION_RECOVERY			0.000000000001
+
+/** Enumerated Types **/
+
+/* Define interrupt codes for generating handling interrupts					*/
+/* indicating changes in deference, frame timeout which infers         			*/
+/* that the collision has occurred, random backoff and transmission 			*/
+/* completion by the physical layer (self interrupts).							*/
+typedef enum WlanT_Mac_Intrpt_Code
+	{	
+	WlanC_Deference_Off,  	/* Deference before frame transmission 				*/
+	WlanC_Frame_Timeout,	/* No frame rcvd in set duration (infer collision)	*/
+	WlanC_Backoff_Elapsed,  /* Backoff done before frame transmission			*/
+	WlanC_CW_Elapsed,		/* Backoff done after successful frame transmission	*/	
+	WlanC_Beacon_Tx_Time,	/* Time to transmit beacon frame                    */
+	WlanC_Scan_Timeout,		/* End of scan duration for given channel 			*/
+	WlanC_AP_Check_Timeout,	/* Time to check the connectivity status with the	*/
+							/* current AP.										*/
+	WlanC_NAV_Reset_Time,	/* Time to reset NAV that is updated by an RTS.		*/
+	WlanC_Cfp_End			/* End of the Contention free period 				*/
+	} WlanT_Mac_Intrpt_Code;
+
+
+/** Data Structures **/
+
+/* This structure contains all the flags used in this process model to determine	*/
+/* various conditions as mentioned in the comments for each flag					*/
+typedef struct WlanT_Mac_Flags
+	{
+	Boolean 	data_frame_to_send; /* Flag to check when station needs to transmit.		*/ 
+	Boolean     backoff_flag;  	    /* Backoff flag is set when either the collision is		*/
+	                                /* inferred or the channel switched from busy to idle	*/
+	Boolean		frame_size_req_rts;	/* Flag that is set when the current frame in process	*/
+									/* of transmission is larger than the RTS threshold.	*/
+	Boolean		rts_sent;   		/* Flag to indicate that whether the RTS for this		*/
+								    /* particular data frame is sent and CTS is received.	*/
+	Boolean		rcvd_bad_packet;	/* Flag to indicate that the received packet is bad		*/
+	Boolean		bad_packet_dropped;	/* Set this flag if the received packet is marked as 	*/
+									/* bad and dropped by this MAC. This flag is used only 	*/
+									/* when we are transmitting a frame.					*/
+    Boolean	    receiver_busy;		/* Set this flag if receiver busy stat is enabled		*/	
+    Boolean	    transmitter_busy;	/* Set this flag if we are transmitting something.		*/	
+	Boolean		wait_eifs_dur;		/* Set this flag if the station needs to wait for eifs	*/
+									/* duration.											*/	
+	Boolean		gateway_flag;		/* Set this flag if the station is a gateway.			*/
+	Boolean		bridge_flag;		/* Set this flag if the station is a bridge				*/
+	Boolean		immediate_xmt;		/* Set this flag if the new frame can be transmitted	*/
+									/* without deferring.									*/
+	Boolean		forced_bk_end;		/* Special case: resume with completion of back-off (or	*/
+									/* CW) period regardless of receiver's status.			*/
+	Boolean		cw_required;		/* Indicates that the MAC is in contention window		*/
+									/* period following a successful transmission.			*/
+	Boolean		perform_cw;			/* Flag that triggers backoff process for CW period.	*/
+	Boolean		nav_updated;		/* Indicates a new NAV value since the last time when	*/
+									/* self interrupt is scheduled for the end of deference.*/
+	Boolean		collision;			/* Set this flag if a channel became busy while another	*/
+									/* one busy.											*/
+	Boolean		duration_zero;		/* Set this flag if duration should be zero in next ack	*/
+	Boolean		ignore_busy;		/* Set this flag if the STA should ignore receiver busy	*/
+	Boolean		tx_beacon;          /* Set this flag if time to send a beacon               */
+	Boolean		tx_cf_end;          /* Set this flag if time to send a CF End frame         */
+	Boolean		pcf_active;         /* Set this flag for AP if PCF is currently in effect	*/
+	Boolean		polled;		        /* Set this flag if the station has received a poll     */
+	Boolean		more_data;			/* Set this flag if must poll for more data (MSDU)		*/
+	Boolean		more_frag;			/* Set this flag if must poll for more fragments		*/
+	Boolean		pcf_side_traf;		/* Set this flag if the AP detects STA to STA traffic   */
+	Boolean		active_poll;		/* Set this flag if an active poll is outstanding		*/
+	Boolean		scanning;			/* Set this flag while running the scanning procedure	*/
+									/* to look for a new access point connectivity.			*/
+	Boolean		non_erp_present;	/* Set this flag if we are an ERP STA and our BSS has	*/
+									/* at least one non-ERP STA.							*/
+	Boolean		cts_to_self;		/* Set this flag if the optional 11g CTS-to-self		*/
+									/* protection mechanism is enabled for this MAC.		*/
+	Boolean		wait_signal_ext;	/* Set if current tx requires 11g signal extension.		*/
+	Boolean		rcvd_bad_cts;		/* Set if a reception is detected during the last		*/
+									/* CTS-to-self transmission.							*/
+	Boolean		pcf_lowered_drate;	/* Set by an 11g AP, if the data rate of current tx is	*/
+									/* lowered due to a piggybacked ACK for a non-ERP STA.	*/
+	} WlanT_Mac_Flags;
+
+/* This structure contains the destination address to which the received	*/
+/* data packet needs to be sent and the contents of the received packet		*/
+/* from the higher layer.												 	*/
+typedef struct WlanT_Hld_List_Elem
+	{
+	double		time_rcvd;  			/* Time packet is received by the higher layer.		*/
+	OpT_Int64	destination_address; 	/* Station to which this packet needs to be sent.	*/
+	OpT_Int64	origination_address;	/* Packet's original source address (used by APs).	*/
+	int			protocol_type;			/* Protocol information of higher layer data.		*/
+	Packet*     pkptr;				 	/* Store packet contents.							*/
+	} WlanT_Hld_List_Elem;
+
+/* Define a structure to maintain data fragments received by each station	*/
+/* for the purpose of reassembly (or defragmentation).		  				*/
+typedef struct WlanT_Mac_Defragmentation_Buffer_Entry
+	{		
+	OpT_Int64	tx_station_address;		/* Store the address of transmitting station.		*/	 
+	double		time_rcvd;				/* Store time the last frag for this frame was rcvd.*/ 
+	Sbhandle	reassembly_buffer_ptr;	/* Store data fragments for a particular packet.	*/  		 
+	} WlanT_Mac_Defragmentation_Buffer_Entry;
+
+/* Information record kept by APs and STAs in IBSSs for each other STA in	*/
+/* their BSSs in order to detect the frames that are received as duplicates	*/
+/* and to check their capabilities when needed.								*/
+typedef struct WlanT_Peer_Info
+	{
+	Boolean		is_erp;
+	int			seq_cntl;
+	} WlanT_Peer_Info;
+
+/** Macro Definitions **/
+
+/* Macro definitions to compute the PLCP overhead for control and data frames.	*/
+#define	PLCP_OVERHEAD_CTRL(size)				(phy_type == WlanC_11b_PHY ? plcp_overhead_control : wlan_non_11b_plcp_overhead_compute (size, control_data_rate))
+#define	PLCP_OVERHEAD_DATA(size)				(phy_type == WlanC_11b_PHY ? plcp_overhead_data    : wlan_non_11b_plcp_overhead_compute (size, operational_speed))
+#define	PLCP_OVERHEAD_CTRL_DR(size,data_rate)	(phy_type == WlanC_11b_PHY ? plcp_overhead_control : wlan_non_11b_plcp_overhead_compute (size, data_rate))
+
+/* Macro definitions to compute the transmission delay of control and data		*/
+/* frames.																		*/
+#define	TXTIME_CTRL(size)				(PLCP_OVERHEAD_CTRL (size) + (double) size / control_data_rate + \
+										 ((phy_char_flag == WlanC_ERP_OFDM_11g && control_data_rate > 5500000.0 && control_data_rate != 11000000.0) ? \
+										  WLANC_11g_SIGNAL_EXTENSION : 0.0))						
+#define	TXTIME_DATA(size)				(PLCP_OVERHEAD_DATA (size) + (double) size / operational_speed + \
+										 ((phy_char_flag == WlanC_ERP_OFDM_11g && operational_speed > 5500000.0 && operational_speed != 11000000.0) ? \
+										  WLANC_11g_SIGNAL_EXTENSION : 0.0))
+#define	TXTIME_CTRL_DR(size,data_rate)	(PLCP_OVERHEAD_CTRL_DR (size, data_rate) + (double) size / data_rate + \
+										 ((phy_char_flag == WlanC_ERP_OFDM_11g && data_rate > 5500000.0 && data_rate != 11000000.0) ? \
+										  WLANC_11g_SIGNAL_EXTENSION : 0.0))
+
+/* The size of the step between two non-overlapping WLAN channels in terms of	*/
+/* channel numbers.																*/
+#define WLANC_CH_STEP_FOR_NO_OVERLAP	((int) ceil (channel_bandwidth / channel_spacing))	
+
+/* Macro to check whether WLAN beacon transmission efficiency mode is on.		*/						
+#define	BEACON_TX_EFFICIENCY_ENABLED	(beacon_tx_count != WLANC_PERIODIC_BEACON_TX)
+						
+						
+/**	State Transitions **/
+
+/** The data frame send flag is set whenever there is a data to be send by	**/
+/** the higher layer or the response frame needs to be sent. However, in 	**/
+/** either case the flag will not be set if the receiver is busy			**/
+/** Frames cannot be transmitted until medium is idle. Once, the medium 	**/
+/** is available then the station is eligible to transmit provided there	**/
+/** is a need for backoff. Once the transmission is complete then the		**/
+/** station will wait for the response provided the frame transmitted  		**/
+/** requires a response (such as RTS and Data frames). If response			**/
+/** is not needed then the station will defer to transmit next packet		**/
+
+/* After receiving a stream interrupt, we need to switch states from	*/
+/* idle to defer or transmit if there is a frame to transmit and the	*/
+/* receiver is not busy													*/ 
+/* If a frame is received indicating that the STA should scan, all bets */
+/* are off, and the STA moves into the scan state to look for other APs */
+#define READY_TO_TRANSMIT		(((intrpt_type == OPC_INTRPT_STRM && wlan_flags->data_frame_to_send == OPC_TRUE && \
+								   (pcf_flag == OPC_BOOLINT_DISABLED || (wlan_flags->pcf_active == OPC_FALSE && \
+								    (ap_flag == OPC_BOOLINT_ENABLED || cfp_ap_medium_control == OPC_FALSE)))) || \
+								  fresp_to_send != WlanC_None || \
+								  wlan_flags->polled == OPC_TRUE || \
+								  wlan_flags->tx_beacon == OPC_TRUE || \
+								  (wlan_flags->pcf_active == OPC_TRUE && ap_flag == OPC_BOOLINT_ENABLED)) && \
+								 AP_CONNECTED)
+
+/* When we have a frame to transmit, we move to transmit state if the	*/
+/* medium was idle for at least a DIFS time, otherwise we go to defer	*/
+/* state.																*/
+#define MEDIUM_IS_IDLE			(wlan_flags->receiver_busy  == OPC_FALSE                          && \
+								 (current_time - rcv_idle_time + PRECISION_RECOVERY >= difs_time) && \
+								 (current_time - nav_duration  + PRECISION_RECOVERY >= difs_time) && \
+								 cfp_ap_medium_control      == OPC_FALSE						  && \
+								 wlan_flags->pcf_active     == OPC_FALSE						  && \
+								 (wlan_flags->wait_eifs_dur == OPC_FALSE || current_time - rcv_idle_time + PRECISION_RECOVERY >= eifs_time))
+
+/* Change state to Defer from Frm_End, if the input buffers are not empty or a frame needs	*/
+/* to be retransmitted or the station has to respond to some frame.							*/		
+#define FRAME_TO_TRANSMIT		(wlan_flags->data_frame_to_send == OPC_TRUE || fresp_to_send != WlanC_None || \
+								 short_retry_count + long_retry_count > 0 || wlan_flags->tx_beacon == OPC_TRUE || \
+								 wlan_flags->cw_required == OPC_TRUE)
+	
+/* After deferring for either collision avoidance or interframe gap		*/
+/* the channel will be available for transmission. 						*/
+#define DEFERENCE_OFF			(intrpt_type == OPC_INTRPT_SELF                                              && \
+								 (intrpt_code == WlanC_Deference_Off || intrpt_code == WlanC_NAV_Reset_Time) && \
+								 (wlan_flags->receiver_busy == OPC_FALSE || fresp_to_send == WlanC_Ack))
+
+/* Issue a transmission complete stat once the packet has successfully 	*/
+/* been transmitted from the source station								*/						 
+#define TRANSMISSION_COMPLETE	(intrpt_type == OPC_INTRPT_STAT && \
+								 op_intrpt_stat () == TRANSMITTER_BUSY_INSTAT)
+
+/* Backoff is performed based on the value of the backoff flag.			*/
+#define PERFORM_BACKOFF			(wlan_flags->backoff_flag == OPC_TRUE || wlan_flags->perform_cw == OPC_TRUE)
+
+/* Need to start transmitting frame once the backoff (self intrpt) 		*/
+/* completed															*/
+#define BACKOFF_COMPLETED		(intrpt_type == OPC_INTRPT_SELF && intrpt_code == WlanC_Backoff_Elapsed && \
+								 (wlan_flags->receiver_busy == OPC_FALSE || wlan_flags->forced_bk_end == OPC_TRUE))
+
+/* Contention Window period, which follows a successful packet			*/
+/* transmission, is completed.											*/
+#define CW_COMPLETED			(intrpt_type == OPC_INTRPT_SELF && intrpt_code == WlanC_CW_Elapsed && \
+								 (wlan_flags->receiver_busy == OPC_FALSE || wlan_flags->forced_bk_end == OPC_TRUE))
+
+/* After transmission the station will wait for a frame response for    */
+/* Data and Rts frames.												    */
+#define WAIT_FOR_FRAME          (expected_frame_type != WlanC_None)
+
+/* Need to retransmit frame if there is a frame timeout and the         */
+/* required frame is not (successfully) received						*/
+#define FRAME_TIMEOUT           ((intrpt_type == OPC_INTRPT_SELF && intrpt_code == WlanC_Frame_Timeout) || \
+								 bad_cts_to_self_rcvd == OPC_TRUE)
+
+/* If the frame is received appropriate response will be transmitted    */
+/* provided the medium is considered to be idle						    */
+#define FRAME_RCVD			    (intrpt_type == OPC_INTRPT_STRM && bad_packet_rcvd == OPC_FALSE && \
+		 						 i_strm == LOW_LAYER_INPUT_STREAM)
+
+/* Skip backoff if no backoff is needed								    */
+#define TRANSMIT_FRAME			(!PERFORM_BACKOFF)
+
+/* Macros that check the status of AP connectivity.						*/
+#define AP_CONNECTED 			(roam_state_ptr->scan_mode == OPC_FALSE)
+
+#define AP_DISCONNECTED 		(roam_state_ptr->scan_mode == OPC_TRUE)
+
+/* Macro that check whether we have a higher layer frame to send.		*/ 
+#define DATA_FRAME_TO_TX 		(wlan_flags->data_frame_to_send == OPC_TRUE)
+
+/* When the contention window period is over then we go to IDLE state	*/
+/* if we don't have another frame to send at that moment. If we have	*/
+/* one then we go to TRANSMIT state if we did not sense any activity	*/
+/* on our receiver for a period that is greater than or equal to DIFS	*/
+/* period; otherwise we go to DEFER state to defer and back-off before	*/
+/* transmitting the new frame.											*/
+#define	BACK_TO_IDLE			(CW_COMPLETED && wlan_flags->data_frame_to_send == OPC_FALSE && AP_CONNECTED)
+	
+#define SEND_NEW_FRAME_AFTER_CW	(CW_COMPLETED && wlan_flags->data_frame_to_send == OPC_TRUE)
+
+/* If we completed a contention window backoff without any more data	*/
+/* frames to send, and if AP is disconnected, then start the scanning	*/
+/* procedure.															*/
+#define SCAN_AFTER_CW			(CW_COMPLETED && wlan_flags->data_frame_to_send == OPC_FALSE && AP_DISCONNECTED)
+
+/* Macros that check the change in the busy status of the receiver.	   	*/
+#define	RECEIVER_BUSY_HIGH		(intrpt_type == OPC_INTRPT_STAT && intrpt_code < TRANSMITTER_BUSY_INSTAT && \
+								 op_stat_local_read (intrpt_code) > rx_power_threshold && !wlan_flags->collision)
+
+#define	RECEIVER_BUSY_LOW		(((intrpt_type == OPC_INTRPT_STAT && intrpt_code < TRANSMITTER_BUSY_INSTAT) || 			\
+								  (intrpt_type == OPC_INTRPT_STRM && i_strm != instrm_from_mac_if)			   ) && 	\
+	                             !wlan_flags->receiver_busy)
+
+/* When the backoff procedure is complete start the transmission.		*/
+#define	PERFORM_TRANSMIT		((BACKOFF_COMPLETED || SEND_NEW_FRAME_AFTER_CW))
+
+/* Move back to DEFER state if the backoff procedure is interrupted		*/
+/* before completion.													*/
+#define	BACK_TO_DEFER			(FRAME_RCVD || (wlan_flags->tx_beacon == OPC_TRUE && !wlan_flags->receiver_busy))
+
+/* Macro to evaluate whether the MAC is in a contention free period.	*/
+#define	IN_CFP					(pcf_flag == OPC_BOOLINT_ENABLED && \
+								 (cfp_ap_medium_control == OPC_TRUE || wlan_flags->pcf_active == OPC_TRUE))
+
+/* After receiving a packet that indicates the end of the current CFP	*/
+/* go to back to IDLE state if there is no packet to transmit in the CP.*/
+#define	IDLE_AFTER_CFP			(intrpt_type == OPC_INTRPT_STRM && !FRAME_TO_TRANSMIT && !IN_CFP)
+
+/* Macro to cancel the self interrupt for end of deference. It is		*/
+/* called at the state transition from DEFER to IDLE.					*/
+#define	CANCEL_DEF_EVENT		(op_ev_cancel (deference_evh))
+
+/* If we are not waiting for a response frame and if AP is				*/
+/* disconnected, start the scanning procedure.							*/
+#define FRM_END_TO_SCAN			(expected_frame_type == WlanC_None && AP_DISCONNECTED)
+
+/* Go to IDLE state if we have no more frames to transmit.				*/
+#define FRM_END_TO_IDLE			(!FRAME_TO_TRANSMIT && expected_frame_type == WlanC_None && !IN_CFP && AP_CONNECTED)
+
+/* Move the DEFER state to defer for the next transmission or			*/
+/* retransmission.														*/
+#define	FRM_END_TO_DEFER		(expected_frame_type == WlanC_None && (FRAME_TO_TRANSMIT || IN_CFP) && AP_CONNECTED)
+
+
+/** Function Prototypes **/
+static void			wlan_mac_sv_init (void);
+static void			wlan_transceiver_channel_init (void);
+static void			wlan_higher_layer_data_arrival (void);
+static void			wlan_hl_packet_drop (Packet* hld_pkptr, OpT_Packet_Size data_size);
+static void			wlan_hlpk_enqueue (Packet* hld_pkptr, OpT_Int64 dest_addr, OpT_Int64 orig_src_addr, int protocol_type, OpT_Packet_Size data_size, Boolean polling);
+static void			wlan_frame_transmit (void);
+static double		wlan_non_11b_plcp_overhead_compute (OpT_Packet_Size mpdu_length, double data_rate);
+static double		wlan_plcp_overhead_ofdm_compute (OpT_Packet_Size mpdu_length, double data_rate);
+static Boolean		wlan_dest_is_11g_enabled (OpT_Int64 dest_mac_addr);
+static void 		wlan_prepare_frame_to_send (WlanT_Mac_Frame_Type frame_type);
+static void			wlan_slot_time_set (double new_slot_time);
+static void			wlan_interrupts_process (void);
+static void			wlan_physical_layer_data_arrival (void);
+static Boolean		wlan_tuple_find (OpT_Int64 sta_addr, int seq_cntl, OpT_Int64 dest_addr, Boolean retry);
+static void			wlan_data_process (Packet* seg_pkptr, OpT_Int64 dest_addr, OpT_Int64 sta_addr, OpT_Int64 final_dest_addr, int protocol_type, int frag_num, int more_frag, OpT_Packet_Id pkt_id);
+static void			wlan_accepted_frame_stats_update (Packet* seg_pkptr);
+static void			wlan_schedule_deference (void);
+static void			wlan_frame_discard (void);
+static void			wlan_pcf_frame_discard (void);
+static void			wlan_mac_rcv_channel_status_update (int channel_id);
+static Boolean		wlan_poll_list_member_find (OpT_Int64 dest_addr); 
+
+static void			wlan_sta_addr_register (int bss_idx, OpT_Int64 sta_addr, int sta_is_ap, Objid sta_mac_objid, WlanT_Phy_Char_Code phy_char);
+static void			wlan_begin_new_scan (void);
+static void			wlan_ap_switch (void);
+static void 		wlan_sta_addr_deregister (int bss_idx, OpT_Int64 sta_addr);
+static void			wlan_reset_sv (void);
+static void 		wlan_find_new_ap_virtual (void);
+
+/* Callback functions		*/
+#if defined (__cplusplus)
+extern "C" {
+#endif
+
+static int	   		wlan_hld_list_elem_add_comp (const void* list_elem_ptr1, const void* list_elem_ptr2);
+
+#if defined (__cplusplus)
+} /* end of 'extern "C" {' */
+#endif
